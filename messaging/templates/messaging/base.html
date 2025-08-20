@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SMS Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;}
+      .stats{display:flex;gap:12px;margin-bottom:16px}
+      .stats>div{background:#f5f7fb;padding:8px 12px;border-radius:8px}
+      table{width:100%;border-collapse:collapse}
+      th,td{padding:8px 10px;border-bottom:1px solid #e5e7eb;vertical-align:top}
+      th{text-align:left}
+    </style>
+  </head>
+  <body>
+    {% block content %}{% endblock %}
+  </body>
+</html>

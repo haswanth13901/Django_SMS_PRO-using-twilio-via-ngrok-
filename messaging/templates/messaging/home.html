@@ -1,0 +1,36 @@
+{% extends "messaging/base.html" %}
+
+{% block content %}
+  <h1>SMS Dashboard</h1>
+
+  <div class="stats">
+    <div>Opted-in users: <strong>{{ counts.opted_in_users }}</strong></div>
+    <div>Sent today: <strong>{{ counts.messages_sent_today }}</strong></div>
+    <div>Delivered today: <strong>{{ counts.delivered_today }}</strong></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>User</th>
+        <th>Direction</th>
+        <th>Status</th>
+        <th>Body</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for m in messages %}
+        <tr>
+          <td>{{ m.created_at|date:"Y-m-d H:i" }}</td>
+          <td>{{ m.to_user.username }}</td>
+          <td>{{ m.direction }}</td>
+          <td>{{ m.status }}</td>
+          <td style="max-width:480px">{{ m.body }}</td>
+        </tr>
+      {% empty %}
+        <tr><td colspan="5">No messages yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
