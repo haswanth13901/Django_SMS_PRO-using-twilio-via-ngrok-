@@ -158,3 +158,5 @@ class AuditLog(models.Model):
     def __str__(self):
         who = self.actor or "system"
         return f"[{self.action}] by {who} at {timezone.localtime(self.created_at).isoformat()}"
+
+# changes are made.
