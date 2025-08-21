@@ -1,23 +1,24 @@
-# messaging/views.py
+# backend/messaging/views.py
 from django.contrib.auth import get_user_model
-from django.contrib.auth.decorators import user_passes_test
 from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
 from django.http import HttpResponse, HttpResponseNotAllowed, JsonResponse
 from django.utils import timezone
 from django.views.generic import TemplateView
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
-from django.shortcuts import render
-
 
 from rest_framework import mixins, viewsets, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-
 from accounts.models import Profile
 from .models import Message
-from .serializer import MessageSerializer, SendMessageSerializer
+
+# Support either serializer.py or serializers.py
+try:
+    from .serializer import MessageSerializer, SendMessageSerializer
+except ModuleNotFoundError:  # if the file is serializers.py
+    from .serializers import MessageSerializer, SendMessageSerializer  # type: ignore
+
 from .services import send_sms
 
 
@@ -27,7 +28,7 @@ class IsManager(permissions.BasePermission):
         return (
             request.user
             and request.user.is_authenticated
-            and request.user.is_staff  # or replace with group-based logic
+            and request.user.is_staff
         )
 
 
@@ -63,33 +64,49 @@ class StatsView(APIView):
 def _apply_twilio_status(message_obj: Message, status: str | None, error_code: str | None):
     """
     Map Twilio MessageStatus into our Message.Status and persist.
-    Keeps unknown statuses in raw_provider_status without flipping primary status.
+    If the model doesn't define mark_status(...), fall back to direct field updates.
     """
     try:
+        def _fallback_update(new_status, **extra):
+            message_obj.status = new_status
+            if "raw" in extra:
+                message_obj.raw_provider_status = extra["raw"]
+            if "error_code" in extra:
+                message_obj.error_code = extra["error_code"]
+            if "delivered_at" in extra:
+                message_obj.delivered_at = extra["delivered_at"]
+            message_obj.save()
+
+        updater = getattr(message_obj, "mark_status", None) or _fallback_update
+
         if status == "delivered":
-            message_obj.mark_status(
-                Message.Status.DELIVERED, raw=status, delivered_at=timezone.now()
+            updater(
+                Message.Status.DELIVERED,
+                raw=status,
+                delivered_at=timezone.now(),
             )
         elif status in {"failed", "undelivered"}:
-            message_obj.mark_status(Message.Status.FAILED, raw=status, error_code=error_code)
+            updater(Message.Status.FAILED, raw=status, error_code=error_code)
         elif status in {"sent", "queued", "accepted"}:
-            message_obj.mark_status(Message.Status.SENT, raw=status)
+            updater(Message.Status.SENT, raw=status)
         else:
-            # Unknown/other status: record raw without changing the main status
+            # Unknown/other status: record raw without changing main status
             message_obj.raw_provider_status = status or "unknown"
             message_obj.save(update_fields=["raw_provider_status"])
     except Exception:
-        # Webhooks should be permissive—never break request handling.
+        # Webhooks should never crash
         pass
 
 
-# ---------------- Simple test sender (POST) ----------------
-
+# ---------------- Simple test sender (POST only) ----------------
 @csrf_exempt
 def send_test_sms(request):
     """
-    Sends a test SMS to user 'alice'. Call this via POST to avoid sending on import.
+    Sends a test SMS to user 'alice'. Must be POST to avoid accidental sends.
     """
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+
     User = get_user_model()
     try:
         u = User.objects.get(username="alice")  # change to your real user
@@ -100,22 +117,26 @@ def send_test_sms(request):
     return JsonResponse({"ok": True})
 
 
-# ---------------- Twilio inbound SMS webhook (minimal/no DB) ----------------
+# ---------------- Twilio inbound SMS webhook ----------------
 @csrf_exempt
 def twilio_inbound_webhook(request):
+    """
+    GET  -> simple health check (for browser)
+    POST -> Twilio posts inbound SMS here (application/x-www-form-urlencoded)
+    """
+    if request.method == "GET":
+        return HttpResponse(
+            "Twilio SMS webhook is up. Send a POST here.",
+            content_type="text/plain",
+            status=200,
+        )
 
-    # Twilio sends POST (form-encoded). Reject GET.
-    if request.method != "GET":
-        return HttpResponseNotAllowed("Twilio inbound SMS webhook - send a POST here.", status=200)
-
-    # Webhook behavior (POST only)
     if request.method != "POST":
-        # NOTE: HttpResponseNotAllowed expects a list of allowed methods
         return HttpResponseNotAllowed(["POST"])
-    
+
     # Typical inbound fields from Twilio
     from_number = request.POST.get("From")      # e.g., "+15551234567"
-    to_number   = request.POST.get("To")        # your Twilio number
+    # to_number   = request.POST.get("To")      # your Twilio number (unused here)
     body        = request.POST.get("Body", "")
     sid         = request.POST.get("MessageSid")  # optional but useful
 
@@ -123,30 +144,30 @@ def twilio_inbound_webhook(request):
     try:
         profile = Profile.objects.select_related("user").get(phone_number=from_number)
         user = profile.user
-        # Store inbound message
         Message.objects.create(
             to_user=user,
             direction=Message.Direction.INBOUND,
             body=body,
             twilio_sid=sid or "",
-            status=Message.Status.DELIVERED,   # inbound arrived at your server
+            status=Message.Status.DELIVERED,   # reached your server
             delivered_at=timezone.now(),
         )
     except Profile.DoesNotExist:
-        # If you want to track unknown senders, you could log them here.
-        pass
+        pass  # Unknown sender; optionally log
 
-    # Respond 200 so Twilio is happy (no auto-reply here)
-    return HttpResponse("OK")
+    return HttpResponse("OK", status=200)
 
-# ---------------- Twilio status webhook (uses imported Message) ----------------
+
+# ---------------- Twilio status webhooks (POST only) ----------------
 @csrf_exempt
-
 def twilio_status_webhook(request):
     """
     Twilio status callback endpoint.
     Updates Message status based on MessageSid + MessageStatus.
     """
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+
     sid = request.POST.get("MessageSid")
     status = request.POST.get("MessageStatus")  # delivered | failed | sent | queued | ...
     error_code = request.POST.get("ErrorCode")
@@ -157,21 +178,21 @@ def twilio_status_webhook(request):
     try:
         m = Message.objects.get(twilio_sid=sid)
     except Message.DoesNotExist:
-        # Ignore unknown SIDs (or log if you prefer)
-        return HttpResponse("OK")
+        return HttpResponse("OK", status=200)
 
     _apply_twilio_status(m, status, error_code)
-    return HttpResponse("OK")
+    return HttpResponse("OK", status=200)
 
 
 # ---------------- Alternate status webhook (lazy-import model) ----------------
 @csrf_exempt
-
 def twilio_status_callback(request):
     """
-    Twilio status callback with lazy model import so migrations/startup never fail
-    if models aren't ready. Functionally equivalent to twilio_status_webhook.
+    Same as twilio_status_webhook but lazy-imports the model.
     """
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+
     sid = request.POST.get("MessageSid")
     status = request.POST.get("MessageStatus")
     error_code = request.POST.get("ErrorCode")
@@ -180,20 +201,23 @@ def twilio_status_callback(request):
         return HttpResponse("missing sid", status=400)
 
     try:
-        # Lazy import to avoid issues during makemigrations/check
         from .models import Message as _Message
         m = _Message.objects.get(twilio_sid=sid)
     except Exception:
-        return HttpResponse("OK")
+        return HttpResponse("OK", status=200)
 
     _apply_twilio_status(m, status, error_code)
-    return HttpResponse("OK")
+    return HttpResponse("OK", status=200)
+
 
 twilio_inbound_sms = twilio_inbound_webhook
 
+
+# ---------------- UI (optional) ----------------
 class ManagerRequiredMixin(LoginRequiredMixin, UserPassesTestMixin):
     def test_func(self):
         return self.request.user.is_staff
+
 
 class HomePageView(ManagerRequiredMixin, TemplateView):
     template_name = "messaging/home.html"
@@ -213,6 +237,3 @@ class HomePageView(ManagerRequiredMixin, TemplateView):
             ).count(),
         }
         return ctx
-
-
-
