@@ -1,4 +1,4 @@
-# messaging/models.py
+# backend/messaging/models.py
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
@@ -35,6 +35,76 @@ class Campaign(models.Model):
 
     def __str__(self):
         return self.name or f"Campaign #{self.pk}"
+
+
+# ---------------- Custom QuerySet / Manager to host domain logic ----------------
+class MessageQuerySet(models.QuerySet):
+    def outbound(self):
+        return self.filter(direction=self.model.Direction.OUTBOUND)
+
+    def delivered(self):
+        return self.filter(status=self.model.Status.DELIVERED)
+
+
+class MessageManager(models.Manager.from_queryset(MessageQuerySet)):
+    def handle_inbound(self, from_number: str | None, body: str, sid: str | None = None):
+        """
+        Domain logic for inbound SMS:
+        - Map 'From' phone number to a user via accounts.Profile.phone_number
+        - Create an INBOUND Message and mark delivered_at
+        Returns the created Message or None if sender unknown.
+        """
+        if not from_number:
+            return None
+
+        # Lazy import to avoid circulars
+        from accounts.models import Profile
+
+        try:
+            profile = Profile.objects.select_related("user").get(phone_number=from_number)
+        except Profile.DoesNotExist:
+            return None
+
+        return self.create(
+            to_user=profile.user,
+            direction=self.model.Direction.INBOUND,
+            body=body or "",
+            twilio_sid=sid or "",
+            status=self.model.Status.DELIVERED,
+            delivered_at=timezone.now(),
+        )
+
+    def handle_status_callback(self, sid: str | None, status: str | None, error_code: str | None = None):
+        """
+        Domain logic for Twilio status webhook.
+        Finds message by SID and applies provider status mapping.
+        Returns the Message or None if not found / invalid input.
+        """
+        if not sid:
+            return None
+        try:
+            m = self.get(twilio_sid=sid)
+        except self.model.DoesNotExist:
+            return None
+        m.set_status_from_twilio(status=status, error_code=error_code)
+        return m
+
+    def stats_for_date(self, date):
+        """
+        Aggregate counts used by StatsView/HomePageView.
+        """
+        # Lazy import to avoid coupling
+        from accounts.models import Profile
+
+        return {
+            "opted_in_users": Profile.objects.filter(sms_opt_in=True).count(),
+            "messages_sent_today": self.filter(
+                direction=self.model.Direction.OUTBOUND, created_at__date=date
+            ).count(),
+            "delivered_today": self.filter(
+                status=self.model.Status.DELIVERED, delivered_at__date=date
+            ).count(),
+        }
 
 
 class Message(models.Model):
@@ -82,7 +152,7 @@ class Message(models.Model):
 
     # Optional linkage to a campaign (part of a broadcast)
     campaign = models.ForeignKey(
-        "Campaign",  # or "messaging.Campaign"
+        "Campaign",
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
@@ -93,6 +163,9 @@ class Message(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
 
+    objects = MessageManager()
+
+    # ---------- Domain helpers ----------
     def mark_status(self, status, raw=None, error_code=None, delivered_at=None):
         self.status = status
         if raw is not None:
@@ -102,6 +175,30 @@ class Message(models.Model):
         if delivered_at is not None:
             self.delivered_at = delivered_at
         self.save(update_fields=["status", "raw_provider_status", "error_code", "delivered_at"])
+
+    def set_status_from_twilio(self, status: str | None, error_code: str | None = None):
+        """
+        Maps Twilio MessageStatus -> internal Message.Status and persists.
+        Safe to call from webhooks; never raises.
+        """
+        try:
+            if status == "delivered":
+                self.mark_status(
+                    self.Status.DELIVERED,
+                    raw=status,
+                    delivered_at=timezone.now(),
+                )
+            elif status in {"failed", "undelivered"}:
+                self.mark_status(self.Status.FAILED, raw=status, error_code=error_code)
+            elif status in {"sent", "queued", "accepted"}:
+                self.mark_status(self.Status.SENT, raw=status)
+            else:
+                # Unknown/other status: record raw without changing main status
+                self.raw_provider_status = status or "unknown"
+                self.save(update_fields=["raw_provider_status"])
+        except Exception:
+            # Webhooks should never crash
+            pass
 
     def __str__(self):
         return f"{self.direction} to {self.to_user} [{self.status}]"
@@ -116,7 +213,6 @@ class Message(models.Model):
         ]
 
 
-# Optional: include AuditLog so admin/services can work without conditional guards
 class AuditLog(models.Model):
     class Action(models.TextChoices):
         SEND_SMS = "SEND_SMS", "Send SMS"
@@ -158,5 +254,3 @@ class AuditLog(models.Model):
     def __str__(self):
         who = self.actor or "system"
         return f"[{self.action}] by {who} at {timezone.localtime(self.created_at).isoformat()}"
-
-# changes are made.
